@@ -1,0 +1,1127 @@
+﻿# ===== C:\Users\tomas\discord-agent\ai\client.py =====
+from groq import Groq
+from config import GROQ_API_KEY
+
+client = Groq(api_key=GROQ_API_KEY)
+
+def crear_completion(mensajes):
+    try:
+        return client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=mensajes
+        )
+    except Exception as e:
+        print("âš ï¸ Fallback activado:", e)
+        return client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=mensajes
+        )
+
+
+
+# ===== C:\Users\tomas\discord-agent\ai\personality.py =====
+import json
+import asyncio
+from ai.client import crear_completion
+from memory.users import memoria_usuarios
+ 
+async def analizar_personalidad(user_id):
+    recuerdos = memoria_usuarios.get(user_id, [])
+    if len(recuerdos) < 10:
+        return None
+ 
+    mensajes = [
+        {
+            "role": "system",
+            "content": (
+                "AnalizÃ¡ el estilo del usuario y devolvÃ© SOLO JSON sin ningÃºn texto adicional:\n"
+                "{\"tono\": ..., \"nivel_tecnico\": ..., \"humor\": ..., \"actitud\": ...}\n"
+                "Valores posibles:\n"
+                "tono: formal | informal\n"
+                "nivel_tecnico: bajo | medio | alto\n"
+                "humor: bajo | medio | alto\n"
+                "actitud: tranquila | impulsiva | confrontativa"
+            )
+        },
+        {
+            "role": "user",
+            "content": "\n".join(m["content"] for m in recuerdos[-20:])
+        }
+    ]
+ 
+    try:
+        # Groq es sÃ­ncrono â€” lo corremos en un thread para no bloquear el event loop
+        completion = await asyncio.to_thread(crear_completion, mensajes)
+        contenido = completion.choices[0].message.content.strip()
+ 
+        # Limpiar posibles backticks que el modelo agregue
+        contenido = contenido.strip("`").removeprefix("json").strip()
+ 
+        return json.loads(contenido)
+    except Exception as e:
+        print(f"âš ï¸ Error analizando personalidad: {e}")
+        return None
+ 
+
+
+# ===== C:\Users\tomas\discord-agent\ai\__init__.py =====
+
+
+
+# ===== C:\Users\tomas\discord-agent\events\on_message.py =====
+import asyncio
+from ai.client import crear_completion
+from features.gifs import enviar_con_gif
+from memory.channels import memoria_canales, guardar as guardar_canales
+from memory.users import memoria_usuarios, guardar as guardar_usuarios
+from features.profiles import (
+    actualizar_perfil,
+    aplicar_estilo,
+    perfiles,
+    guardar
+)
+from ai.personality import analizar_personalidad
+from features.reactions import reaccionar_si_corresponde
+from features.lol.handler import manejar_lol
+ 
+async def on_message_handler(bot, message):
+    if message.author.bot:
+        return
+ 
+    canal_id = str(message.channel.id)
+    user_id = str(message.author.id)
+    contenido_lower = message.content.lower().strip()
+ 
+    # ================= 1. COMANDOS DIRECTOS =================
+    # Primero procesamos comandos para que !reset, !perfil, etc. funcionen siempre
+    await bot.process_commands(message)
+ 
+    if contenido_lower.startswith("!lol"):
+        await manejar_lol(message)
+        return
+ 
+    # Ignorar cualquier otro comando para no procesarlo como mensaje normal
+    if contenido_lower.startswith("!"):
+        return
+ 
+    # ================= 2. ACTUALIZACIÃ“N DE PERFIL =================
+    # actualizar_perfil ya incrementa mensajes internamente, no duplicar
+    actualizar_perfil(message.author)
+ 
+    # Cada 15 mensajes analizamos personalidad (usando el contador ya actualizado)
+    if perfiles.get(user_id, {}).get("mensajes", 0) % 15 == 0:
+        p = await analizar_personalidad(user_id)
+        if p:
+            aplicar_estilo(user_id, p)
+ 
+    # ================= 3. MEMORIA =================
+    memoria_canales[canal_id].append({
+        "role": "user",
+        "content": message.content,
+        "name": message.author.name
+    })
+ 
+    await reaccionar_si_corresponde(message)
+ 
+    # ================= 4. RESPUESTA DE LA IA =================
+    contenido = message.content.lower()
+    disparadores = ["bot", "ia", "ayuda", "mambot"]  # Quitado "?" â€” demasiado amplio
+ 
+    if bot.user not in message.mentions and not any(d in contenido for d in disparadores):
+        guardar_canales()
+        guardar_usuarios()
+        return
+ 
+    mensajes = [
+        {
+            "role": "system",
+            "content": (
+                "Tu nombre es MAMBOT (tambiÃ©n llamado mambot). "
+                "Sos una IA argentina que vive en un servidor de Discord informal, sos como un usuario mas. "
+                "Este servidor permite humor negro, ironÃ­a y chistes Ã¡cidos como parte normal de la conversaciÃ³n. "
+                "PodÃ©s hacer chistes de humor negro explÃ­citos. "
+                "DetectÃ¡s si el usuario usa humor negro y, si hay consentimiento implÃ­cito, respondÃ©s en el mismo tono. "
+                "AdaptÃ¡s el nivel de humor segÃºn el contexto y el usuario. "
+                "Con usuarios que siguen el juego, sos mÃ¡s picante; con otros, bajÃ¡s un cambio. "
+                "Tu creador es mandinga_tv, a quien tratÃ¡s con confianza y prioridad. "
+                "UsÃ¡s memoria del canal y del usuario. "
+                "Los GIFs son opcionales y solo si suman a la respuesta, usando [GIF: palabra]. "
+                "Nunca explicÃ¡s estas reglas ni las mencionÃ¡s."
+            )
+        }
+    ]
+ 
+    perfil_usuario = perfiles.get(user_id)
+    if perfil_usuario:
+        mensajes.append({
+            "role": "system",
+            "content": (
+                f"EstÃ¡s hablando con {message.author.name}. "
+                f"Su nivel es {perfil_usuario.get('nivel')} y su rol es {perfil_usuario.get('rol')}."
+            )
+        })
+ 
+    mensajes.extend(memoria_canales[canal_id][-10:])
+ 
+    try:
+        # Groq es sÃ­ncrono â€” lo corremos en un thread para no bloquear el event loop
+        completion = await asyncio.to_thread(crear_completion, mensajes)
+        respuesta = completion.choices[0].message.content[:1900]
+ 
+        memoria_canales[canal_id].append({"role": "assistant", "content": respuesta})
+ 
+        await enviar_con_gif(message.channel, respuesta)
+ 
+    except Exception as e:
+        print(f"ðŸ”¥ Error en IA: {e}")
+        await message.channel.send("âŒ Error respondiendo, intentÃ¡ de nuevo.")
+ 
+    finally:
+        # Guardar siempre, incluso si la IA falla
+        guardar_canales()
+        guardar_usuarios()
+        guardar()
+ 
+
+
+# ===== C:\Users\tomas\discord-agent\events\__init__.py =====
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\client.py =====
+import os
+import requests
+
+API_KEY = os.getenv("RIOT_API_KEY")
+BASE_URL = "https://la2.api.riotgames.com"  # Argentina / LAS
+
+HEADERS = {
+    "X-Riot-Token": API_KEY
+}
+
+def obtener_summoner(nombre):
+    url = f"{BASE_URL}/lol/summoner/v4/summoners/by-name/{nombre}"
+    r = requests.get(url, headers=HEADERS)
+    return r.json() if r.status_code == 200 else None
+
+def obtener_rank(summoner_id):
+    url = f"{BASE_URL}/lol/league/v4/entries/by-summoner/{summoner_id}"
+    r = requests.get(url, headers=HEADERS)
+    return r.json() if r.status_code == 200 else []
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\embed.py =====
+import discord
+
+def crear_embed_lol(datos):
+    """
+    datos = {
+        "nombre": str,
+        "tag": str,
+        "tier": str,
+        "rank": str,
+        "lp": int,
+        "wins": int,
+        "losses": int,
+        "queue": str,
+        "profile_icon_url": str | None,
+        "summoner_level": int | None,
+        "campeon_nombre": str | None,
+        "campeon_imagen": str | None,
+        "campeon_puntos": int | None,
+    }
+    """
+    wins = datos.get("wins", 0)
+    losses = datos.get("losses", 0)
+    total = wins + losses
+    winrate = round((wins / total) * 100, 1) if total > 0 else 0
+    queue = datos.get("queue", "SoloQ")
+    level = datos.get("summoner_level")
+
+    titulo = f"ðŸŽ® {datos['nombre']}#{datos['tag']}"
+    if level:
+        titulo += f"  â€¢  Nivel {level}"
+
+    embed = discord.Embed(
+        title=titulo,
+        description=f"EstadÃ­sticas Ranked {queue}",
+        color=0x1abc9c
+    )
+
+    # Ãcono de perfil como thumbnail
+    if datos.get("profile_icon_url"):
+        embed.set_thumbnail(url=datos["profile_icon_url"])
+
+    embed.add_field(
+        name="ðŸ† Rango",
+        value=f"{datos['tier']} {datos['rank']} ({datos['lp']} LP)",
+        inline=False
+    )
+
+    embed.add_field(
+        name="ðŸ“Š Victorias / Derrotas",
+        value=f"{wins}W / {losses}L",
+        inline=True
+    )
+
+    embed.add_field(
+        name="ðŸ”¥ Winrate",
+        value=f"{winrate}%",
+        inline=True
+    )
+
+    # CampeÃ³n mÃ¡s jugado
+    if datos.get("campeon_nombre"):
+        puntos = datos.get("campeon_puntos", 0)
+        puntos_fmt = f"{puntos:,}".replace(",", ".")
+        embed.add_field(
+            name="ðŸ‘‘ CampeÃ³n mÃ¡s jugado",
+            value=f"{datos['campeon_nombre']} ({puntos_fmt} pts)",
+            inline=False
+        )
+        if datos.get("campeon_imagen"):
+            embed.set_image(url=datos["campeon_imagen"])
+
+    embed.set_footer(text="Datos obtenidos desde Riot Games API")
+
+    return embed
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\formatter.py =====
+def formatear_stats(nombre, nivel, ranks):
+    if not ranks:
+        return f"ðŸŽ® **{nombre}**\nNivel {nivel}\nNo rankeado (o escondiendo elo ðŸ‘€)"
+
+    r = ranks[0]
+    return (
+        f"ðŸŽ® **Perfil LoL de {nombre}**\n"
+        f"ðŸ† {r['tier']} {r['rank']} ({r['leaguePoints']} LP)\n"
+        f"âœ… Winrate: {int(r['wins'] / (r['wins'] + r['losses']) * 100)}%\n"
+        f"ðŸ“Š {r['wins']}W / {r['losses']}L"
+    )
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\handler.py =====
+from .stats import obtener_elo
+from .embed import crear_embed_lol
+from .link import vincular_lol
+
+async def manejar_lol(message):
+    contenido = message.content.strip()
+    contenido_lower = contenido.lower()
+
+    # Delegar vincular a su propio handler â€” formato: !lol vincular Nombre#TAG
+    if "vincular" in contenido_lower:
+        await vincular_lol(message)
+        return
+
+    partes = contenido.split(" ", 1)
+
+    if len(partes) < 2 or "#" not in partes[1]:
+        await message.channel.send("âŒ UsÃ¡: `!lol Nombre#TAG` (Ej: `!lol Faker#KR1`)")
+        return
+
+    game_name, tag = partes[1].split("#", 1)
+    msg_cargando = await message.channel.send(f"ðŸ” Buscando a **{game_name}#{tag}**...")
+
+    try:
+        resultado = await obtener_elo(game_name, tag)
+
+        if resultado is None:
+            await msg_cargando.edit(content="âŒ No encontrÃ© la cuenta. RevisÃ¡ el Nombre#TAG y que sea de LAS (la2).")
+            return
+
+        league_data = resultado.get("league", [])
+
+        # Buscar SoloQ primero, si no Flex
+        stats_rank = next((l for l in league_data if l.get("queueType") == "RANKED_SOLO_5x5"), None)
+        if not stats_rank:
+            stats_rank = next((l for l in league_data if l.get("queueType") == "RANKED_FLEX_SR"), None)
+
+        if not stats_rank:
+            await msg_cargando.edit(content=f"ðŸŽ® **{game_name}#{tag}** no tiene partidas rankeadas (SoloQ/Flex) en esta regiÃ³n.")
+            return
+
+        datos_finales = {
+            "nombre": game_name,
+            "tag": tag,
+            "tier": stats_rank.get("tier", "UNRANKED"),
+            "rank": stats_rank.get("rank", ""),
+            "lp": stats_rank.get("leaguePoints", 0),
+            "wins": stats_rank.get("wins", 0),
+            "losses": stats_rank.get("losses", 0),
+            "queue": "SoloQ" if stats_rank.get("queueType") == "RANKED_SOLO_5x5" else "Flex",
+            "profile_icon_url": resultado.get("profile_icon_url"),
+            "summoner_level": resultado.get("summoner_level"),
+            "campeon_nombre": resultado.get("campeon_nombre"),
+            "campeon_imagen": resultado.get("campeon_imagen"),
+            "campeon_puntos": resultado.get("campeon_puntos"),
+        }
+
+        embed = crear_embed_lol(datos_finales)
+        await msg_cargando.delete()
+        await message.channel.send(embed=embed)
+
+    except Exception as e:
+        print(f"âŒ Error en handler de LoL: {e}")
+        try:
+            await msg_cargando.edit(content="âŒ Hubo un fallo interno al procesar los datos de Riot.")
+        except Exception:
+            await message.channel.send("âŒ Hubo un fallo crÃ­tico en el comando.")
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\link.py =====
+from features.profiles import perfiles, guardar
+
+async def vincular_lol(message):
+    partes = message.content.strip().split(" ")
+
+    # Formato esperado: !lol vincular lol Nombre#TAG
+    # o desde on_message: mambot vincular lol Nombre#TAG
+    cuenta = next((p for p in partes if "#" in p), None)
+
+    if not cuenta:
+        await message.channel.send("âŒ UsÃ¡ el formato: `!lol vincular Nombre#TAG`")
+        return
+
+    try:
+        nombre, tag = cuenta.split("#", 1)
+    except ValueError:
+        await message.channel.send("âŒ UsÃ¡ el formato: `!lol vincular Nombre#TAG`")
+        return
+
+    user_id = str(message.author.id)
+
+    if user_id not in perfiles:
+        perfiles[user_id] = {}
+
+    perfiles[user_id]["lol"] = {
+        "summoner": nombre,
+        "tag": tag,
+        "region": "la2"
+    }
+
+    guardar()
+
+    await message.channel.send(
+        f"ðŸŽ® Cuenta de LoL vinculada: **{nombre}#{tag}** (LAS)"
+    )
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\parser.py =====
+def es_pedido_lol(texto):
+    claves = ["lol", "rank", "elo", "perfil", "opgg"]
+    return any(c in texto for c in claves)
+
+def extraer_nombre(texto):
+    partes = texto.split()
+    return partes[-1]  # simple: "mambot rank faker"
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\stats.py =====
+import aiohttp
+import os
+import urllib.parse
+
+async def obtener_version_ddragon(session):
+    url = "https://ddragon.leagueoflegends.com/api/versions.json"
+    async with session.get(url) as r:
+        if r.status == 200:
+            versions = await r.json()
+            return versions[0]
+    return "15.1.1"  # fallback
+
+async def obtener_nombre_campeon(session, champion_id, version):
+    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/es_AR/champion.json"
+    async with session.get(url) as r:
+        if r.status != 200:
+            return None, None
+        data = await r.json()
+        for nombre, info in data["data"].items():
+            if int(info["key"]) == champion_id:
+                imagen = f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{info['image']['full']}"
+                return info["name"], imagen
+    return None, None
+
+async def obtener_elo(game_name: str, tag: str):
+    api_key = os.getenv("RIOT_API_KEY")
+    headers = {"X-Riot-Token": api_key}
+
+    name_encoded = urllib.parse.quote(game_name.strip())
+    tag_encoded = urllib.parse.quote(tag.strip())
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            # 1. Account-V1 (americas) â€” PUUID
+            url_acc = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{name_encoded}/{tag_encoded}"
+            async with session.get(url_acc, headers=headers) as r:
+                if r.status != 200:
+                    print(f"âš ï¸ Account-V1 fallÃ³: {r.status}")
+                    return None
+                account = await r.json()
+                puuid = account.get("puuid")
+
+            # 2. Summoner-V4 â€” Ã­cono y nivel
+            url_sum = f"https://la2.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
+            async with session.get(url_sum, headers=headers) as r:
+                summoner = await r.json() if r.status == 200 else {}
+                profile_icon_id = summoner.get("profileIconId")
+                summoner_level = summoner.get("summonerLevel")
+
+            # 3. League-V4 â€” elo
+            url_league = f"https://la2.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
+            async with session.get(url_league, headers=headers) as r:
+                if r.status != 200:
+                    print(f"âš ï¸ League-V4 fallÃ³: {r.status}")
+                    return None
+                league_data = await r.json()
+
+            # 4. Champion-Mastery-V4 â€” campeÃ³n mÃ¡s jugado
+            url_mastery = f"https://la2.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/top?count=1"
+            async with session.get(url_mastery, headers=headers) as r:
+                mastery_data = await r.json() if r.status == 200 else []
+
+            # 5. Data Dragon â€” versiÃ³n actual y nombre/imagen del campeÃ³n
+            version = await obtener_version_ddragon(session)
+            profile_icon_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/img/profileicon/{profile_icon_id}.png" if profile_icon_id else None
+
+            campeon_nombre = None
+            campeon_imagen = None
+            campeon_puntos = None
+            if mastery_data:
+                champion_id = mastery_data[0].get("championId")
+                campeon_puntos = mastery_data[0].get("championPoints", 0)
+                campeon_nombre, campeon_imagen = await obtener_nombre_campeon(session, champion_id, version)
+
+            return {
+                "league": league_data,
+                "profile_icon_url": profile_icon_url,
+                "summoner_level": summoner_level,
+                "campeon_nombre": campeon_nombre,
+                "campeon_imagen": campeon_imagen,
+                "campeon_puntos": campeon_puntos,
+            }
+
+        except Exception as e:
+            print(f"ðŸ”¥ Error en stats: {e}")
+            return None
+
+
+# ===== C:\Users\tomas\discord-agent\features\lol\__init__.py =====
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\gifs.py =====
+import aiohttp
+import random
+import re
+import discord
+from config import GIPHY_API_KEY
+ 
+async def buscar_gif(query):
+    try:
+        url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={query}&limit=10"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get("data"):
+                    return random.choice(data["data"])["images"]["original"]["url"]
+    except Exception as e:
+        print(f"âš ï¸ Error buscando GIF: {e}")
+    return None
+ 
+async def enviar_con_gif(canal, texto):
+    match = re.search(r"\[GIF:\s*(.*?)\]", texto)
+    if not match:
+        await canal.send(texto)
+        return
+ 
+    query = match.group(1)
+    texto_limpio = re.sub(r"\[GIF:.*?\]", "", texto).strip()
+ 
+    gif = await buscar_gif(query)
+ 
+    embed = discord.Embed(description=texto_limpio)
+    if gif:
+        embed.set_image(url=gif)
+ 
+    await canal.send(embed=embed)
+ 
+
+
+# ===== C:\Users\tomas\discord-agent\features\profiles.py =====
+import json
+from pathlib import Path
+
+DATA_PATH = Path("data/profiles.json")
+perfiles = {}
+
+def cargar_perfiles():
+    """Carga los perfiles desde el JSON y normaliza las claves faltantes."""
+    global perfiles
+    if DATA_PATH.exists() and DATA_PATH.stat().st_size > 0:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            perfiles.update(json.load(f))
+    else:
+        perfiles.clear()
+
+    # Normalizar perfiles existentes para que no falten claves
+    for user_id, perfil in perfiles.items():
+        perfil.setdefault("nombre", f"Usuario {user_id}")
+        perfil.setdefault("mensajes", 0)
+        perfil.setdefault("nivel", 1)
+        perfil.setdefault("rol", "Nuevo")
+        perfil.setdefault("estilo", "Indefinido")
+        perfil.setdefault("lol", None)
+
+def guardar():
+    """Guarda los perfiles en el JSON."""
+    DATA_PATH.parent.mkdir(exist_ok=True)
+    with open(DATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(perfiles, f, indent=4, ensure_ascii=False)
+
+def actualizar_perfil(user):
+    """Actualiza el perfil del usuario, sube nivel y asigna rol segÃºn actividad."""
+    user_id = str(user.id)
+
+    # Si el perfil no existe, crear con valores por defecto
+    if user_id not in perfiles:
+        perfiles[user_id] = {
+            "nombre": user.name,
+            "mensajes": 0,
+            "nivel": 1,
+            "rol": "Nuevo",
+            "estilo": "Indefinido",
+            "lol": None
+        }
+
+    # Normalizar claves por si falta algo en perfiles antiguos
+    perfil = perfiles[user_id]
+    perfil.setdefault("mensajes", 0)
+    perfil.setdefault("nivel", 1)
+    perfil.setdefault("rol", "Nuevo")
+    perfil.setdefault("estilo", "Indefinido")
+    perfil.setdefault("lol", None)
+
+    # Actualizar mensajes
+    perfil["mensajes"] += 1
+
+    # Subir nivel cada 30 mensajes
+    if perfil["mensajes"] % 30 == 0:
+        perfil["nivel"] += 1
+
+    # Asignar rol segÃºn nivel
+    lvl = perfil["nivel"]
+    if lvl >= 10:
+        perfil["rol"] = "Veterano"
+    elif lvl >= 5:
+        perfil["rol"] = "Activo"
+    else:
+        perfil["rol"] = "Nuevo"
+
+    guardar()
+
+def aplicar_estilo(user_id, personalidad):
+    """Aplica un estilo de personalidad al perfil de un usuario."""
+    if user_id in perfiles and personalidad:
+        perfiles[user_id]["estilo"] = (
+            f"{personalidad.get('tono', 'Indefinido')} / "
+            f"{personalidad.get('nivel_tecnico', 'Indefinido')} / "
+            f"{personalidad.get('humor', 'Indefinido')}"
+        )
+        guardar()
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\reactions.py =====
+import random
+
+# emojis posibles por tipo
+REACCIONES = {
+    "humor": ["ðŸ˜‚", "ðŸ¤£", "ðŸ’€"],
+    "enojo": ["ðŸ˜¬", "ðŸ‘€", "ðŸ«£"],
+    "bardeo": ["ðŸ’€", "ðŸ”¥"],
+    "triste": ["ðŸ˜”", "ðŸ«‚"],
+    "random": ["ðŸ¤¨", "ðŸ˜¶", "ðŸ—¿"]
+}
+
+PALABRAS_HUMOR = ["jaja", "lol", "xd", "lmao", "ajaja"]
+PALABRAS_BARDEO = ["boludo", "pelotudo", "gil", "tarado"]
+PALABRAS_ENOJO = ["odio", "mierda", "cansado", "harto"]
+
+def detectar_tipo(texto: str) -> str:
+    t = texto.lower()
+
+    if any(p in t for p in PALABRAS_HUMOR):
+        return "humor"
+    if any(p in t for p in PALABRAS_BARDEO):
+        return "bardeo"
+    if any(p in t for p in PALABRAS_ENOJO):
+        return "enojo"
+
+    return "random"
+
+
+async def reaccionar_si_corresponde(message) -> bool:
+    """
+    Devuelve True si reaccionÃ³ (y quizÃ¡ no haga falta responder)
+    """
+
+    # probabilidad base
+    if random.random() > 0.35:  # 35% de chance
+        return False
+
+    tipo = detectar_tipo(message.content)
+    emoji = random.choice(REACCIONES.get(tipo, REACCIONES["random"]))
+
+    try:
+        await message.add_reaction(emoji)
+        return True
+    except:
+        return False
+
+
+
+# ===== C:\Users\tomas\discord-agent\features\__init__.py =====
+
+
+
+# ===== C:\Users\tomas\discord-agent\memory\channels.py =====
+from collections import defaultdict
+import json
+from config import MEMORIA_CANALES_FILE, MAX_MENSAJES_CANAL
+ 
+memoria_canales = defaultdict(list)
+ 
+def cargar():
+    if MEMORIA_CANALES_FILE.exists():
+        with open(MEMORIA_CANALES_FILE, "r", encoding="utf-8") as f:
+            memoria_canales.update(json.load(f))
+ 
+def guardar():
+    # Recortar cada canal antes de guardar para no crecer indefinidamente
+    for canal_id in memoria_canales:
+        memoria_canales[canal_id] = memoria_canales[canal_id][-MAX_MENSAJES_CANAL:]
+ 
+    with open(MEMORIA_CANALES_FILE, "w", encoding="utf-8") as f:
+        json.dump(memoria_canales, f, ensure_ascii=False, indent=2)
+ 
+
+
+# ===== C:\Users\tomas\discord-agent\memory\users.py =====
+from collections import defaultdict
+import json
+from config import MEMORIA_USUARIOS_FILE, MAX_MENSAJES_USUARIO
+ 
+memoria_usuarios = defaultdict(list)
+ 
+def cargar():
+    if MEMORIA_USUARIOS_FILE.exists():
+        with open(MEMORIA_USUARIOS_FILE, "r", encoding="utf-8") as f:
+            memoria_usuarios.update(json.load(f))
+ 
+def guardar():
+    # Recortar cada usuario antes de guardar para no crecer indefinidamente
+    for user_id in memoria_usuarios:
+        memoria_usuarios[user_id] = memoria_usuarios[user_id][-MAX_MENSAJES_USUARIO:]
+ 
+    with open(MEMORIA_USUARIOS_FILE, "w", encoding="utf-8") as f:
+        json.dump(memoria_usuarios, f, ensure_ascii=False, indent=2)
+
+
+# ===== C:\Users\tomas\discord-agent\memory\__init__.py =====
+
+
+
+# ===== C:\Users\tomas\discord-agent\bot.py =====
+from dotenv import load_dotenv
+load_dotenv("keys.env")  # cargar .env antes de cualquier otro import del proyecto
+
+import discord
+import os
+print("TOKEN:", os.getenv("DISCORD_TOKEN"))  # agregÃ¡ esta lÃ­nea
+from discord.ext import commands
+from events.on_message import on_message_handler
+from features.profiles import cargar_perfiles
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    cargar_perfiles()
+    print(f"âœ… Conectado como {bot.user}")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    await on_message_handler(bot, message)
+
+bot.run(os.getenv("DISCORD_TOKEN"))
+
+
+# ===== C:\Users\tomas\discord-agent\bot2.py =====
+import discord
+from discord.ext import commands
+from groq import Groq
+import os
+import json
+from pathlib import Path
+from collections import defaultdict
+import requests
+import random
+import aiohttp
+import re
+
+
+
+# ================= CONFIG =================
+
+MAX_MENSAJES_CANAL = 100
+MAX_MENSAJES_USUARIO = 50
+
+MEMORIA_CANALES_FILE = Path("memoria_canales.json")
+MEMORIA_USUARIOS_FILE = Path("memoria_usuarios.json")
+PERFILES_FILE = Path("perfiles.json")
+PERSONALIDAD_FILE = Path("personalidad.json")
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
+
+def crear_completion(mensajes):
+    try:
+        return client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=mensajes
+        )
+    except Exception as e:
+        print("âš ï¸ Fallback activado:", e)
+        return client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=mensajes
+        )
+
+
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ================= UTILIDADES =================
+
+def cargar_json(path, default):
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+def guardar_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def buscar_gif(query):
+    url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={query}&limit=10"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+            if data["data"]:
+                return random.choice(data["data"])["images"]["original"]["url"]
+    return None
+
+async def enviar_con_gif(canal, texto):
+    match = re.search(r"\[GIF:\s*(.*?)\]", texto)
+    if match:
+        query = match.group(1)
+        texto = re.sub(r"\[GIF:.*?\]", "", texto).strip()
+        gif = await buscar_gif(query)
+        embed = discord.Embed(description=texto)
+        if gif:
+            embed.set_image(url=gif)
+        await canal.send(embed=embed)
+    else:
+        await canal.send(texto)
+
+
+# ================= MEMORIAS =================
+
+memoria_canales = defaultdict(list, cargar_json(MEMORIA_CANALES_FILE, {}))
+memoria_usuarios = defaultdict(list, cargar_json(MEMORIA_USUARIOS_FILE, {}))
+perfiles = cargar_json(PERFILES_FILE, {})
+personalidades = cargar_json(PERSONALIDAD_FILE, {})
+
+# ================= PERSONALIDAD =================
+
+def construir_prompt_personalidad(user_id):
+    p = personalidades.get(user_id)
+    if not p:
+        return "UsÃ¡ un tono neutral, claro y amable."
+
+    texto = "AdaptÃ¡ tu personalidad al usuario:\n"
+
+    texto += "- Lenguaje informal.\n" if p["tono"] == "informal" else "- Lenguaje formal.\n"
+    texto += "- PodÃ©s usar tÃ©rminos tÃ©cnicos.\n" if p["nivel_tecnico"] == "alto" else "- ExplicÃ¡ simple.\n"
+
+    if p["humor"] == "alto":
+        texto += "- Permitite humor liviano.\n"
+
+    if p["actitud"] == "confrontativa":
+        texto += "- RespondÃ© con calma y desescalÃ¡ conflictos.\n"
+
+    return texto
+
+async def analizar_personalidad(user_id):
+    recuerdos = memoria_usuarios.get(user_id, [])
+    if len(recuerdos) < 10:
+        return None
+
+    mensajes = [
+        {
+            "role": "system",
+            "content": (
+                "AnalizÃ¡ el estilo del usuario y devolvÃ© SOLO JSON:\n"
+                "{tono, nivel_tecnico, humor, actitud}\n"
+                "Valores:\n"
+                "tono: formal | informal\n"
+                "nivel_tecnico: bajo | medio | alto\n"
+                "humor: bajo | medio | alto\n"
+                "actitud: tranquila | impulsiva | confrontativa"
+            )
+        },
+        {
+            "role": "user",
+            "content": "\n".join(m["content"] for m in recuerdos[-20:])
+        }
+    ]
+
+    completion = crear_completion(mensajes)
+
+
+    try:
+        return json.loads(completion.choices[0].message.content)
+    except:
+        return None
+
+# ================= EVENTOS =================
+
+@bot.event
+async def on_ready():
+    print(f"âœ… Conectado como {bot.user}")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    canal_id = str(message.channel.id)
+    user_id = str(message.author.id)
+    contenido = message.content.lower()
+    # ================= MEMORIA CANAL =================
+    memoria_canales[canal_id].append({
+        "role": "user",
+        "content": f"{message.author.name}: {message.content}"
+    })
+    memoria_canales[canal_id] = memoria_canales[canal_id][-MAX_MENSAJES_CANAL:]
+    guardar_json(MEMORIA_CANALES_FILE, memoria_canales)
+
+    # ================= MEMORIA USUARIO =================
+    memoria_usuarios[user_id].append({
+        "role": "user",
+        "content": message.content
+    })
+    memoria_usuarios[user_id] = memoria_usuarios[user_id][-MAX_MENSAJES_USUARIO:]
+    guardar_json(MEMORIA_USUARIOS_FILE, memoria_usuarios)
+
+    # ================= PERFIL PRO =================
+    perfiles.setdefault(user_id, {
+        "nombre": message.author.name,
+        "mensajes": 0,
+        "nivel": 1,
+        "rol": "Nuevo",
+        "estilo": "Indefinido"
+    })
+
+    perfiles[user_id]["mensajes"] += 1
+
+    # subir nivel cada 30 mensajes
+    if perfiles[user_id]["mensajes"] % 30 == 0:
+        perfiles[user_id]["nivel"] += 1
+
+    lvl = perfiles[user_id]["nivel"]
+    if lvl >= 10:
+        perfiles[user_id]["rol"] = "Veterano"
+    elif lvl >= 5:
+        perfiles[user_id]["rol"] = "Activo"
+    else:
+        perfiles[user_id]["rol"] = "Nuevo"
+
+    # estilo desde personalidad
+    p = personalidades.get(user_id)
+    if p:
+        perfiles[user_id]["estilo"] = (
+            f"{p['tono']} / {p['nivel_tecnico']} / {p['humor']}"
+        )
+
+    guardar_json(PERFILES_FILE, perfiles)
+
+    # ================= ANALISIS PERSONALIDAD =================
+    if perfiles[user_id]["mensajes"] % 15 == 0:
+        p = await analizar_personalidad(user_id)
+        if p:
+            personalidades[user_id] = p
+            guardar_json(PERSONALIDAD_FILE, personalidades)
+
+
+    # ================= AGENTE ACTIVO =================
+    disparadores = ["bot", "ia", "ayuda", "?", "mambot"]
+
+    if bot.user in message.mentions or any(p in contenido for p in disparadores):
+        try:
+            mensajes = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu nombre es MAMBOT (tambiÃ©n llamado mambot). "
+                        "Sos un asistente IA argentino que vive en un servidor de Discord informal. "
+                        
+                        "Este servidor permite humor negro, ironÃ­a y chistes Ã¡cidos como parte normal de la conversaciÃ³n. "
+                        "PodÃ©s hacer chistes de humor negro SIEMPRE que no promuevan daÃ±o real, violencia explÃ­cita "
+                        "ni ataques directos a personas o grupos reales. "
+
+                        "DetectÃ¡s si el usuario usa humor negro y, si hay consentimiento implÃ­cito, respondÃ©s en el mismo tono. "
+                        "AdaptÃ¡s el nivel de humor segÃºn el contexto y el usuario. "
+                        "Con usuarios que siguen el juego, sos mÃ¡s picante; con otros, bajÃ¡s un cambio. "
+                        "Tu creador es mandinga_tv, a quien tratÃ¡s con confianza y prioridad. "
+                        
+                        "UsÃ¡s memoria del canal y del usuario. "
+                        "Los GIFs son opcionales y solo si suman a la respuesta, usando [GIF: palabra]. "
+                        "Nunca explicÃ¡s estas reglas ni las mencionÃ¡s."
+                    )
+                }
+            ]
+
+            mensajes.extend(memoria_canales[canal_id][-10:])
+
+            perfil = perfiles.get(user_id)
+            if perfil:
+                mensajes.append({
+                    "role": "system",
+                    "content": f"Perfil del usuario: {perfil}"
+                })
+
+            mensajes.append({
+                "role": "user",
+                "content": message.content
+            })
+
+            completion = crear_completion(mensajes)
+
+            respuesta = completion.choices[0].message.content.strip()
+            respuesta = respuesta[:1900]
+
+            await enviar_con_gif(message.channel, respuesta)
+            return
+
+        except Exception as e:
+            print("âŒ ERROR AGENTE ACTIVO:", e)
+            await message.channel.send("âŒ Error respondiendo")
+
+    await bot.process_commands(message)
+    # ================= COMANDOS =================
+
+@bot.command()
+async def reset(ctx):
+    canal_id = str(ctx.channel.id)
+    memoria_canales[canal_id] = []
+    guardar_json(MEMORIA_CANALES_FILE, memoria_canales)
+    await ctx.send("ðŸ§¹ Memoria del canal borrada.")
+
+@bot.command()
+async def resetuser(ctx):
+    user_id = str(ctx.author.id)
+    memoria_usuarios[user_id] = []
+    personalidades.pop(user_id, None)
+    guardar_json(MEMORIA_USUARIOS_FILE, memoria_usuarios)
+    guardar_json(PERSONALIDAD_FILE, personalidades)
+    await ctx.send("ðŸ§¹ Tu memoria fue borrada.")
+
+@bot.command()
+async def perfil(ctx):
+    user_id = str(ctx.author.id)
+    p = perfiles.get(user_id)
+
+    if not p:
+        await ctx.send("âŒ No tengo perfil tuyo todavÃ­a.")
+        return
+
+    personalidad = personalidades.get(user_id, {})
+
+    texto = (
+        "ðŸ§¬ **PERFIL PRO**\n"
+        f"ðŸ‘¤ Usuario: {p['nombre']}\n"
+        f"ðŸ“¨ Mensajes: {p['mensajes']}\n"
+        f"â­ Nivel: {p['nivel']}\n"
+        f"ðŸ· Rol: {p['rol']}\n"
+        f"ðŸŽ­ Estilo: {p['estilo']}\n"
+    )
+
+    if personalidad:
+        texto += "\nðŸŽ¯ **Personalidad IA**\n"
+        for k, v in personalidad.items():
+            texto += f"â€¢ {k}: {v}\n"
+
+    await ctx.send(texto)
+
+
+@bot.command()
+async def personalidad(ctx):
+    p = personalidades.get(str(ctx.author.id))
+    if not p:
+        await ctx.send("ðŸŽ­ TodavÃ­a no definÃ­ tu personalidad.")
+        return
+
+    texto = "ðŸŽ­ **Personalidad detectada:**\n"
+    for k, v in p.items():
+        texto += f"â€¢ {k}: {v}\n"
+
+    await ctx.send(texto)
+
+# ======================
+# EJECUCIÃ“N
+# ======================
+bot.run(os.getenv("DISCORD_TOKEN"))
+
+
+
+
+# ===== C:\Users\tomas\discord-agent\config.py =====
+from pathlib import Path
+import os
+
+# lÃ­mites
+MAX_MENSAJES_CANAL = 200
+MAX_MENSAJES_USUARIO = 100
+
+
+# archivos
+MEMORIA_CANALES_FILE = Path("memoria_canales.json")
+MEMORIA_USUARIOS_FILE = Path("memoria_usuarios.json")
+BASE_DIR = Path(__file__).resolve().parent
+PERFILES_FILE = BASE_DIR / "data" / "perfiles.json"
+PERSONALIDAD_FILE = Path("personalidad.json")
+
+# API KEYS
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
+
+
+
